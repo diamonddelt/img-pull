@@ -6,7 +6,11 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"os"
+	"path"
 	"strings"
 
 	"github.com/gocolly/colly"
@@ -19,8 +23,11 @@ func main() {
 func imagePull(dataType string, downloadDir string, domains ...string) error {
 	var err error
 
-	// basic collector
 	c := colly.NewCollector(
+
+		// uncomment to enable debugger
+		// colly.Debugger(&debug.LogDebugger{}),
+
 		// setup domains to pull from
 		// colly.AllowedDomains(domains...),
 
@@ -32,34 +39,36 @@ func imagePull(dataType string, downloadDir string, domains ...string) error {
 		// execute collector requests asynchronously
 		colly.Async(true),
 	)
-	d := c.Clone() // duplicate collector to be used for downloading images
 
-	// logs for each request
+	// map to hold absolute URLs of images
+	m := map[string]bool{}
+
 	c.OnRequest(func(r *colly.Request) {
 		fmt.Println("Collecting all", dataType, "from", r.URL.String())
 	})
 
-	if dataType == ".gif" {
-		c.OnHTML("img[src]", func(e *colly.HTMLElement) {
-			src := e.Attr("src") // get the src attribute of the img
-			fmt.Printf("Image found with src: %s\n", src)
+	c.OnHTML("img[src]", func(e *colly.HTMLElement) {
+		src := e.Attr("src")
+		fmt.Printf("Image found with src: %s\n", src)
 
-			// handle image src with content hosted at FQDNs
-			if strings.Contains(src, "http") {
-				e.Request.Visit(src)
-				c.OnResponse(func(r *colly.Response) {
-					fmt.Printf("Navigated to direct image source!")
-				})
-			} else {
-				fmt.Println("Visiting absolute URI for image src", src, "at", e.Request.AbsoluteURL(src))
-				d.Visit(e.Request.AbsoluteURL(src))
-				d.OnResponse(func(r *colly.Response) {
-					downloadFileFromResponse(e.Request.AbsoluteURL(src), downloadDir, r)
-				})
+		// handle image src with content hosted at FQDNs
+		if strings.Contains(src, "http") {
+			e.Request.Visit(src)
+			c.OnResponse(func(r *colly.Response) {
+				fmt.Printf("Navigated to direct image source!")
+			})
+		} else if strings.Contains(src, ".gif"){
+			fmt.Println("Appending absolute URL for image src to array", src, "at", e.Request.AbsoluteURL(src))
+
+			// if the image absolute URL is not contained within the map, add it
+			if _, ok := m[e.Request.AbsoluteURL(src)]; !ok {
+				m[e.Request.AbsoluteURL(src)] = true
+				fmt.Println(e.Request.AbsoluteURL(src), "was added to the map")
 			}
-		})
-	}
+		}
+	})
 
+	// visit all domains passed into imagePull()
 	for _, v := range domains {
 		fmt.Println("Visiting", v)
 
@@ -72,21 +81,38 @@ func imagePull(dataType string, downloadDir string, domains ...string) error {
 		}
 	}
 
-	// TODO: understand the async ordering better... the calls below execute in the wrong order
-	d.Wait() // wait until download aggregater collector threads are finished
 	c.Wait() // wait until main collector thread is finished
+
+	// download data using net/http to avoid dealing with nested callbacks in colly
+	downloadImageDataFromMap(m, downloadDir)
 
 	return nil
 }
 
-func downloadFileFromResponse(url string, dir string, r *colly.Response) error {
-	var err error
+func downloadImageDataFromMap(m map[string]bool, dir string) error {
+	// traverse the map, and use path.Base to get the "last element of the path" i.e. the filename
+	for k, _ := range m {
+		fmt.Println("Saving", path.Base(k), "to", dir)
 
-	fmt.Println("Saving file at", dir+r.FileName())
-	err = r.Save(dir + r.FileName()) // FileName returns the sanitized file name parsed from "Content-Disposition" header or from URL
-	if err != nil {
-		log.Print("unable to save image from URL", url, "to filesystem location", dir)
-		return err
+		// create the file
+		out, err := os.Create(dir + path.Base(k))
+		if err != nil {
+			return err
+		}
+		defer out.Close()
+
+		// get the raw HTTP response data
+		res, err := http.Get(k)
+		if err != nil {
+			return err
+		}
+		defer res.Body.Close()
+
+		// write the response body (image data) to file
+		_, err = io.Copy(out, res.Body)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
